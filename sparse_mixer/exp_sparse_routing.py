@@ -63,8 +63,8 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sparse_mixer.estimators import (
-    st_single, reinmax_single, reinmax_v3_single,
-    reinmax_topk, reinmax_v3_topk,
+    st_single, reinmax_single, reinmax_v3_single, reinmax_cv_single,
+    reinmax_topk, reinmax_v3_topk, reinmax_cv_topk,
 )
 from sparse_mixer.objectives import QuadraticObjective
 from sparse_mixer.metrics    import collect_grad_samples, bias_variance_metrics
@@ -145,7 +145,7 @@ def run_fixed_sparsity_scaling(
 
     results = {
         name: dict(bias=[], variance=[], mse=[])
-        for name in ['reinmax', 'reinmax_v3']
+        for name in ['reinmax', 'reinmax_v3', 'reinmax_cv']
     }
     scale_labels = []
 
@@ -165,6 +165,7 @@ def run_fixed_sparsity_scaling(
             method_fns = {
                 'reinmax'    : lambda l, k_=k: reinmax_single(l, tau),
                 'reinmax_v3' : lambda l, k_=k: reinmax_v3_single(l, tau, repeats),
+                'reinmax_cv' : lambda l, k_=k, r_=repeats: reinmax_cv_single(l, tau, eta=0.9, repeats=r_),
             }
             ref = exact
         else:
@@ -175,6 +176,7 @@ def run_fixed_sparsity_scaling(
             method_fns = {
                 'reinmax'    : lambda l, k_=k: reinmax_topk(l, k=k_, tau=tau),
                 'reinmax_v3' : lambda l, k_=k: reinmax_v3_topk(l, k=k_, tau=tau, repeats=repeats),
+                'reinmax_cv' : lambda l, k_=k, r_=repeats: reinmax_cv_topk(l, k=k_, tau=tau, eta=0.9, repeats=r_),
             }
 
         for name, fn in method_fns.items():
@@ -219,13 +221,16 @@ def plot_fixed_sparsity_scaling(results, scale_labels, save_dir=SPARSE_DIR):
         ax.set_ylabel(ylabel); ax.set_title(title); ax.set_yscale(yscale)
         ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
 
-    # Add variance-ratio annotation
+    # Add variance-ratio annotations (v3/rm and cv/rm)
     for j, label in enumerate(scale_labels):
         v_rm = results['reinmax']['variance'][j]
         v_v3 = results['reinmax_v3']['variance'][j]
-        ratio = v_v3 / (v_rm + 1e-12)
-        axes[1].annotate(f'×{ratio:.2f}', xy=(j, v_v3),
-                         xytext=(5, 5), textcoords='offset points', fontsize=7)
+        v_cv = results['reinmax_cv']['variance'][j]
+        axes[1].annotate(f'×{v_v3/(v_rm+1e-12):.2f}', xy=(j, v_v3),
+                         xytext=(5,  5), textcoords='offset points', fontsize=7)
+        axes[1].annotate(f'×{v_cv/(v_rm+1e-12):.2f}', xy=(j, v_cv),
+                         xytext=(5, -12), textcoords='offset points', fontsize=7,
+                         color=COLOURS.get('reinmax_cv', '#888'))
 
     plt.suptitle('Gradient Statistics at Fixed Sparsity Ratio K/N ≈ 3.1%', fontsize=12)
     save_fig(os.path.join(save_dir, 'fixed_sparsity_scaling.png'))
@@ -267,6 +272,7 @@ def run_large_scale_variance(
     methods = {
         'reinmax'    : lambda l: reinmax_topk(l, k=k, tau=tau),
         'reinmax_v3' : lambda l: reinmax_v3_topk(l, k=k, tau=tau, repeats=repeats),
+        'reinmax_cv' : lambda l: reinmax_cv_topk(l, k=k, tau=tau, eta=0.9, repeats=repeats),
     }
 
     results = {}
@@ -282,8 +288,11 @@ def run_large_scale_variance(
 
     v_rm = results['reinmax']['variance']
     v_v3 = results['reinmax_v3']['variance']
+    v_cv = results['reinmax_cv']['variance']
     print(f"\n  Variance ratio (v3/reinmax): {v_v3/(v_rm+1e-12):.3f}  "
           f"({'↓' if v_v3 < v_rm else '↑'} variance)")
+    print(f"  Variance ratio (cv/reinmax): {v_cv/(v_rm+1e-12):.3f}  "
+          f"({'↓' if v_cv < v_rm else '↑'} variance)")
     return results
 
 
@@ -312,8 +321,10 @@ def plot_large_scale_variance(results, n_experts, k, save_dir=SPARSE_DIR):
     # Add variance-reduction annotation
     v_rm = results['reinmax']['variance']
     v_v3 = results['reinmax_v3']['variance']
-    ratio = v_v3 / (v_rm + 1e-12)
-    axes[1].set_title(f'Gradient Variance  (v3/rm = {ratio:.2f})')
+    v_cv = results['reinmax_cv']['variance']
+    axes[1].set_title(
+        f'Gradient Variance  (v3/rm={v_v3/(v_rm+1e-12):.2f}  cv/rm={v_cv/(v_rm+1e-12):.2f})'
+    )
 
     plt.suptitle(f'Head-to-Head at N={n_experts}, K={k}  '
                  f'(Very Sparse: K/N = {k/n_experts:.1%})', fontsize=12)
@@ -359,6 +370,7 @@ def run_convergence_at_scale(
     methods = {
         'reinmax'    : lambda l: reinmax_topk(l, k=k, tau=tau),
         'reinmax_v3' : lambda l: reinmax_v3_topk(l, k=k, tau=tau, repeats=repeats),
+        'reinmax_cv' : lambda l: reinmax_cv_topk(l, k=k, tau=tau, eta=0.9, repeats=repeats),
     }
 
     history = {}
@@ -501,6 +513,8 @@ def run_k_ablation(
             ('reinmax',     lambda l, k_=k: reinmax_topk(l, k=k_, tau=tau)),
             ('reinmax_v3',  lambda l, k_=k, r_=repeats:
                             reinmax_v3_topk(l, k=k_, tau=tau, repeats=r_)),
+            ('reinmax_cv',  lambda l, k_=k, r_=repeats:
+                            reinmax_cv_topk(l, k=k_, tau=tau, eta=0.9, repeats=r_)),
         ]:
             t0 = time.time()
             grads = collect_grad_samples(fn, logits, topk_obj, n_samples)
@@ -512,7 +526,9 @@ def run_k_ablation(
 
         v_rm = var_results[k]['reinmax']['variance']
         v_v3 = var_results[k]['reinmax_v3']['variance']
-        print(f"    variance ratio v3/rm: {v_v3/(v_rm+1e-12):.3f}")
+        v_cv = var_results[k]['reinmax_cv']['variance']
+        print(f"    variance ratio v3/rm: {v_v3/(v_rm+1e-12):.3f}  "
+              f"cv/rm: {v_cv/(v_rm+1e-12):.3f}")
 
     # ── Part 2: convergence curves ────────────────────────────────────────────
     print(f"\n  Convergence at each K ({n_steps_conv} steps, lr={lr_conv}):")
@@ -555,7 +571,7 @@ def plot_k_ablation(var_results, conv_history, random_ef_global,
 
     # ── Panel 1: Gradient Variance vs K ──────────────────────────────────────
     ax = axes[0]
-    for name in ['reinmax', 'reinmax_v3']:
+    for name in ['reinmax', 'reinmax_v3', 'reinmax_cv']:
         vars_ = [var_results[k][name]['variance'] for k in k_values]
         ax.plot(k_values, vars_, color=COLOURS.get(name, '#888'),
                 label=name, lw=2, marker='o', ms=6)
@@ -564,14 +580,16 @@ def plot_k_ablation(var_results, conv_history, random_ef_global,
     ax.set_yscale('log'); ax.set_xscale('log', base=2)
     ax.set_xticks(k_values); ax.set_xticklabels(k_values)
     ax.legend(fontsize=9); ax.grid(True, alpha=0.3, which='both')
-    # Annotate variance-reduction ratio
+    # Annotate variance-reduction ratios (v3/rm and cv/rm)
     for k in k_values:
         v_rm = var_results[k]['reinmax']['variance']
         v_v3 = var_results[k]['reinmax_v3']['variance']
-        ratio = v_v3 / (v_rm + 1e-12)
-        x_pos = k_values.index(k)
-        ax.annotate(f'×{ratio:.2f}', xy=(k, v_v3),
-                    xytext=(4, 4), textcoords='offset points', fontsize=7)
+        v_cv = var_results[k]['reinmax_cv']['variance']
+        ax.annotate(f'×{v_v3/(v_rm+1e-12):.2f}', xy=(k, v_v3),
+                    xytext=(4,  4), textcoords='offset points', fontsize=7)
+        ax.annotate(f'×{v_cv/(v_rm+1e-12):.2f}', xy=(k, v_cv),
+                    xytext=(4, -12), textcoords='offset points', fontsize=7,
+                    color=COLOURS.get('reinmax_cv', '#888'))
 
     # ── Panel 2: E[f(z)] convergence ─────────────────────────────────────────
     ax = axes[1]
@@ -633,13 +651,18 @@ def main(fast: bool = False):
     }
     v_rm_list = r13a['reinmax']['variance']
     v_v3_list = r13a['reinmax_v3']['variance']
-    ratios = [v3 / (rm + 1e-12) for v3, rm in zip(v_v3_list, v_rm_list)]
-    summary['fixed_sparsity']['variance_ratios'] = {
-        lbl: ratio for lbl, ratio in zip(scale_labels, ratios)
+    v_cv_list = r13a['reinmax_cv']['variance']
+    ratios_v3 = [v3 / (rm + 1e-12) for v3, rm in zip(v_v3_list, v_rm_list)]
+    ratios_cv = [cv / (rm + 1e-12) for cv, rm in zip(v_cv_list, v_rm_list)]
+    summary['fixed_sparsity']['variance_ratios_v3'] = {
+        lbl: ratio for lbl, ratio in zip(scale_labels, ratios_v3)
     }
-    print(f"\n  Variance ratios (v3/reinmax) across scales:")
-    for lbl, ratio in zip(scale_labels, ratios):
-        print(f"    {lbl:14s}: {ratio:.3f}")
+    summary['fixed_sparsity']['variance_ratios_cv'] = {
+        lbl: ratio for lbl, ratio in zip(scale_labels, ratios_cv)
+    }
+    print(f"\n  Variance ratios across scales:")
+    for lbl, rv3, rcv in zip(scale_labels, ratios_v3, ratios_cv):
+        print(f"    {lbl:14s}: v3/rm={rv3:.3f}  cv/rm={rcv:.3f}")
 
     # ── Exp 13b ──────────────────────────────────────────────────────────────
     r13b = run_large_scale_variance(
@@ -687,8 +710,10 @@ def main(fast: bool = False):
 
     summary['k_ablation'] = {
         str(k): {
-            'variance_ratio': (r13d_var[k]['reinmax_v3']['variance'] /
-                               (r13d_var[k]['reinmax']['variance'] + 1e-12)),
+            'variance_ratio_v3': (r13d_var[k]['reinmax_v3']['variance'] /
+                                  (r13d_var[k]['reinmax']['variance'] + 1e-12)),
+            'variance_ratio_cv': (r13d_var[k]['reinmax_cv']['variance'] /
+                                  (r13d_var[k]['reinmax']['variance'] + 1e-12)),
             'final_ef':      r13d_conv[k]['ef'][-1],
             'final_overlap': r13d_conv[k]['overlap'][-1],
             'oracle_ef':     r13d_conv[k]['oracle_ef'],
@@ -705,24 +730,26 @@ def main(fast: bool = False):
     print(f"\n{'='*60}")
     print("SPARSE ROUTING SUMMARY  (N=256)")
     print('='*60)
-    print(f"\n13a — Variance ratio (v3/reinmax) at each scale:")
-    for lbl, ratio in zip(scale_labels, ratios):
-        symbol = '↓' if ratio < 1 else '↑'
-        print(f"  {lbl:14s}: {ratio:.3f}  {symbol}")
+    print(f"\n13a — Variance ratios at each scale:")
+    for lbl, rv3, rcv in zip(scale_labels, ratios_v3, ratios_cv):
+        sv3 = '↓' if rv3 < 1 else '↑'
+        scv = '↓' if rcv < 1 else '↑'
+        print(f"  {lbl:14s}: v3/rm={rv3:.3f} {sv3}  cv/rm={rcv:.3f} {scv}")
     print(f"\n13b — At N=256, K=8:")
     for name, m in r13b.items():
         print(f"  {name:14s}: var={m['variance']:.4f}  mse={m['mse']:.4f}")
-    print(f"\n13c — Convergence (reinmax vs reinmax_v3, K=8):")
+    print(f"\n13c — Convergence (K=8):")
     for name, h in r13c.items():
         print(f"  {name:14s}: E[f]={h['ef'][-1]:.4f}  "
               f"overlap={h['overlap'][-1]:.3f}")
     print(f"  oracle          : E[f]={oracle_ef:.4f}")
     print(f"\n13d — K ablation at N=256:")
-    print(f"  {'K':>5}  {'density':>8}  {'v3/rm':>7}  {'final E[f]':>11}  "
-          f"{'overlap':>8}  {'oracle':>7}")
+    print(f"  {'K':>5}  {'density':>8}  {'v3/rm':>7}  {'cv/rm':>7}  "
+          f"{'final E[f]':>11}  {'overlap':>8}  {'oracle':>7}")
     for k in _K_ABLATION_VALUES:
         d = summary['k_ablation'][str(k)]
-        print(f"  {k:>5}  {k/256:>8.1%}  {d['variance_ratio']:>7.3f}  "
+        print(f"  {k:>5}  {k/256:>8.1%}  {d['variance_ratio_v3']:>7.3f}  "
+              f"{d['variance_ratio_cv']:>7.3f}  "
               f"{d['final_ef']:>11.4f}  {d['final_overlap']:>8.3f}  "
               f"{d['oracle_ef']:>7.4f}")
 
