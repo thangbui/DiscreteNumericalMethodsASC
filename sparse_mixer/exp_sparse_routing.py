@@ -1,6 +1,6 @@
 """
-Experiment 13 — Very Sparse Routing: K=8 selected from N=256 experts
-=====================================================================
+Experiment 13 — Sparse Routing at Scale: N=256 experts
+=======================================================
 
 Motivation
 ----------
@@ -10,7 +10,8 @@ are active per token — the same sparsity ratio as K=1, N=32, but the
 combinatorial routing space is astronomically larger (C(256,8) ≈ 10^14 vs 32).
 
 This experiment asks: does gradient estimator variance grow catastrophically
-with scale, and does ReinMax-v3 remain beneficial in this regime?
+with scale, and does ReinMax-v3 remain beneficial in this regime?  And how
+does the answer change as we relax sparsity (more K per token)?
 
 Sub-experiments
 ---------------
@@ -28,13 +29,21 @@ Sub-experiments
        • E[f(z)]         — objective value
        • Top-K overlap   — fraction of true top-8 experts in the selected set
 
+13d  K ablation at fixed N=256
+     K ∈ {8, 16, 32, 64, 128} (density 3% → 50%).
+     Two panels:
+       • Variance/MSE vs K for reinmax vs reinmax_v3  (adaptive R for large K)
+       • Convergence curves for each K (reinmax_topk), showing that
+         less sparse routing finds good experts much faster.
+
 Key expected findings
 ---------------------
 • Gradient variance grows roughly as O(N * K), so absolute variance at
   N=256, K=8 is ~64× higher than N=32, K=1.
 • ReinMax-v3's Rao-Gumbel Jacobian provides consistent relative variance
-  reduction (~40-55%) regardless of scale.
-• Convergence at N=256 is much slower; lower-variance estimators help.
+  reduction (~40-55%) regardless of scale or K.
+• Convergence at N=256 is much slower for small K; larger K provides a
+  denser reward signal that dramatically accelerates learning.
 """
 
 from __future__ import annotations
@@ -420,6 +429,186 @@ def plot_convergence_at_scale(history, random_ef, oracle_ef, n_experts, k,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Exp 13d — K ablation at fixed N=256: K ∈ {8, 16, 32, 64, 128}
+# ─────────────────────────────────────────────────────────────────────────────
+
+_K_ABLATION_VALUES = [8, 16, 32, 64, 128]
+
+
+def _k_ablation_params(k: int, fast: bool):
+    """
+    Adaptive (n_samples, repeats, n_ref) for the K ablation.
+
+    `_rao_gumbel_jacobian_topk` has cost O(K * R) per backward pass, so we
+    scale down R and n_samples for large K to keep wall-time manageable.
+    """
+    if fast:
+        table = {8: (12, 4, 100), 16: (8, 3, 100),
+                 32: (6, 2, 100), 64: (4, 2, 100), 128: (3, 2, 80)}
+    else:
+        table = {8: (100, 20, 1500), 16: (60, 12, 1000),
+                 32: (40,  8,  800), 64: (20,  5,  500), 128: (10, 3, 300)}
+    n_s, reps, n_r = table[k]
+    return dict(n_samples=n_s, repeats=reps, n_ref=n_r)
+
+
+def run_k_ablation(
+    n_experts: int = 256,
+    k_values: list = _K_ABLATION_VALUES,
+    batch_size: int = 2,
+    tau: float = 1.0,
+    n_steps_conv: int = 600,
+    lr_conv: float = 0.05,
+    batch_size_conv: int = 8,
+    fast: bool = False,
+    seed: int = 42,
+) -> Dict:
+    """
+    Exp 13d: variance and convergence for K ∈ {8,16,32,64,128} at N=256.
+
+    Returns
+    -------
+    var_results : dict  {k: {'reinmax': metrics, 'reinmax_v3': metrics}}
+    conv_history: dict  {k: {'ef': [...], 'overlap': [...], 'oracle_ef': float}}
+    """
+    print(f"\n{'='*60}")
+    print(f"Exp 13d: K ablation at N={n_experts}")
+    print(f"  K values: {k_values}  τ={tau}")
+    print('='*60)
+
+    torch.manual_seed(seed)
+    obj    = QuadraticObjective(n_experts, seed=seed)
+    f_vals = obj.f_at_experts()
+
+    # ── Part 1: gradient variance ─────────────────────────────────────────────
+    var_results = {}
+    for k in k_values:
+        p = _k_ablation_params(k, fast)
+        n_samples, repeats, n_ref = p['n_samples'], p['repeats'], p['n_ref']
+        topk_obj = _topk_normalised_obj(obj, k)
+
+        print(f"\n  K={k:3d}  (n_samples={n_samples}, R={repeats}, n_ref={n_ref})")
+
+        # REINFORCE reference
+        torch.manual_seed(seed)
+        logits = torch.randn(batch_size, n_experts) * 1.5
+        print(f"    REINFORCE ref ({n_ref} samples)…", end='', flush=True)
+        ref = _reinforce_reference(logits, topk_obj, k, tau, n_ref)
+        print(' done.')
+
+        var_results[k] = {}
+        for name, fn in [
+            ('reinmax',     lambda l, k_=k: reinmax_topk(l, k=k_, tau=tau)),
+            ('reinmax_v3',  lambda l, k_=k, r_=repeats:
+                            reinmax_v3_topk(l, k=k_, tau=tau, repeats=r_)),
+        ]:
+            t0 = time.time()
+            grads = collect_grad_samples(fn, logits, topk_obj, n_samples)
+            m     = bias_variance_metrics(grads, ref)
+            elapsed = time.time() - t0
+            var_results[k][name] = m
+            print(f"    [{name:12s}] bias={m['bias']:.5f}  "
+                  f"var={m['variance']:.5f}  mse={m['mse']:.5f}  ({elapsed:.1f}s)")
+
+        v_rm = var_results[k]['reinmax']['variance']
+        v_v3 = var_results[k]['reinmax_v3']['variance']
+        print(f"    variance ratio v3/rm: {v_v3/(v_rm+1e-12):.3f}")
+
+    # ── Part 2: convergence curves ────────────────────────────────────────────
+    print(f"\n  Convergence at each K ({n_steps_conv} steps, lr={lr_conv}):")
+    conv_history = {}
+    for k in k_values:
+        topk_obj = _topk_normalised_obj(obj, k)
+        true_topk_idx = f_vals.topk(k).indices.tolist()
+        oracle_ef     = f_vals.topk(k).values.mean().item()
+
+        torch.manual_seed(seed)
+        logits = nn.Parameter(torch.randn(batch_size_conv, n_experts) * 0.01)
+        opt    = torch.optim.SGD([logits], lr=lr_conv)
+        ef_traj, ov_traj = [], []
+
+        for _ in range(n_steps_conv):
+            opt.zero_grad()
+            mask, _ = reinmax_topk(logits, k=k, tau=tau)
+            loss    = -obj(mask / k).mean()
+            loss.backward()
+            opt.step()
+
+            with torch.no_grad():
+                p  = F.softmax(logits, dim=-1)
+                ef = (p * f_vals).sum(-1).mean().item()
+                ov = _true_top_k_overlap(logits, f_vals, k)
+            ef_traj.append(ef)
+            ov_traj.append(ov)
+
+        conv_history[k] = dict(ef=ef_traj, overlap=ov_traj, oracle_ef=oracle_ef)
+        random_ef_k = f_vals.topk(k).values.mean().item()  # oracle for this K
+        print(f"    K={k:3d}: final E[f]={ef_traj[-1]:.4f}  "
+              f"overlap={ov_traj[-1]:.3f}  oracle={oracle_ef:.4f}")
+
+    return var_results, conv_history, f_vals.mean().item()
+
+
+def plot_k_ablation(var_results, conv_history, random_ef_global,
+                    n_experts, k_values, save_dir=SPARSE_DIR):
+    fig, axes = plt.subplots(1, 3, figsize=(17, 4.5))
+
+    # ── Panel 1: Gradient Variance vs K ──────────────────────────────────────
+    ax = axes[0]
+    for name in ['reinmax', 'reinmax_v3']:
+        vars_ = [var_results[k][name]['variance'] for k in k_values]
+        ax.plot(k_values, vars_, color=COLOURS.get(name, '#888'),
+                label=name, lw=2, marker='o', ms=6)
+    ax.set_xlabel('K (experts selected)'); ax.set_ylabel('Gradient Variance')
+    ax.set_title(f'Variance vs K  (N={n_experts})')
+    ax.set_yscale('log'); ax.set_xscale('log', base=2)
+    ax.set_xticks(k_values); ax.set_xticklabels(k_values)
+    ax.legend(fontsize=9); ax.grid(True, alpha=0.3, which='both')
+    # Annotate variance-reduction ratio
+    for k in k_values:
+        v_rm = var_results[k]['reinmax']['variance']
+        v_v3 = var_results[k]['reinmax_v3']['variance']
+        ratio = v_v3 / (v_rm + 1e-12)
+        x_pos = k_values.index(k)
+        ax.annotate(f'×{ratio:.2f}', xy=(k, v_v3),
+                    xytext=(4, 4), textcoords='offset points', fontsize=7)
+
+    # ── Panel 2: E[f(z)] convergence ─────────────────────────────────────────
+    ax = axes[1]
+    cmap = plt.cm.plasma
+    colours_k = [cmap(i / (len(k_values) - 1)) for i in range(len(k_values))]
+    for (k, data), c in zip(conv_history.items(), colours_k):
+        density = k / n_experts
+        ax.plot(data['ef'], color=c, lw=1.8,
+                label=f'K={k} ({density:.0%})')
+        ax.axhline(data['oracle_ef'], color=c, ls='--', lw=0.8, alpha=0.5)
+    ax.axhline(random_ef_global, color='grey', ls=':', lw=1.5, label='random')
+    ax.set_xlabel('step'); ax.set_ylabel('E[f(z)]')
+    ax.set_title(f'Convergence: E[f(z)] vs step  (N={n_experts})')
+    ax.legend(fontsize=7, ncol=2); ax.grid(True, alpha=0.3)
+
+    # ── Panel 3: Top-K overlap convergence ───────────────────────────────────
+    ax = axes[2]
+    for (k, data), c in zip(conv_history.items(), colours_k):
+        density = k / n_experts
+        random_overlap = k / n_experts
+        ax.plot(data['overlap'], color=c, lw=1.8,
+                label=f'K={k} ({density:.0%})')
+    ax.set_xlabel('step')
+    ax.set_ylabel('Top-K overlap fraction')
+    ax.set_title(f'Top-K Overlap vs step  (N={n_experts})')
+    ax.set_ylim(0, 1.05)
+    ax.legend(fontsize=7, ncol=2); ax.grid(True, alpha=0.3)
+
+    plt.suptitle(
+        f'K Ablation at Fixed N={n_experts}  '
+        f'(K ∈ {{{", ".join(map(str, k_values))}}}, density {k_values[0]/n_experts:.0%}–{k_values[-1]/n_experts:.0%})',
+        fontsize=11,
+    )
+    save_fig(os.path.join(save_dir, 'k_ablation_n256.png'))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -482,6 +671,31 @@ def main(fast: bool = False):
     summary['convergence']['oracle_ef']  = oracle_ef
     summary['convergence']['random_ef']  = rand_ef
 
+    # ── Exp 13d ──────────────────────────────────────────────────────────────
+    r13d_var, r13d_conv, r13d_rand = run_k_ablation(
+        n_experts=256,
+        k_values=_K_ABLATION_VALUES,
+        batch_size=2,
+        tau=1.0,
+        n_steps_conv=n_steps,
+        lr_conv=0.05,
+        batch_size_conv=8,
+        fast=fast,
+    )
+    plot_k_ablation(r13d_var, r13d_conv, r13d_rand,
+                    n_experts=256, k_values=_K_ABLATION_VALUES)
+
+    summary['k_ablation'] = {
+        str(k): {
+            'variance_ratio': (r13d_var[k]['reinmax_v3']['variance'] /
+                               (r13d_var[k]['reinmax']['variance'] + 1e-12)),
+            'final_ef':      r13d_conv[k]['ef'][-1],
+            'final_overlap': r13d_conv[k]['overlap'][-1],
+            'oracle_ef':     r13d_conv[k]['oracle_ef'],
+        }
+        for k in _K_ABLATION_VALUES
+    }
+
     path = os.path.join(SPARSE_DIR, 'sparse_routing_summary.json')
     with open(path, 'w') as f:
         json.dump(summary, f, indent=2)
@@ -489,7 +703,7 @@ def main(fast: bool = False):
 
     # Final print
     print(f"\n{'='*60}")
-    print("SPARSE ROUTING SUMMARY  (K=8 from N=256)")
+    print("SPARSE ROUTING SUMMARY  (N=256)")
     print('='*60)
     print(f"\n13a — Variance ratio (v3/reinmax) at each scale:")
     for lbl, ratio in zip(scale_labels, ratios):
@@ -498,11 +712,19 @@ def main(fast: bool = False):
     print(f"\n13b — At N=256, K=8:")
     for name, m in r13b.items():
         print(f"  {name:14s}: var={m['variance']:.4f}  mse={m['mse']:.4f}")
-    print(f"\n13c — Convergence:")
+    print(f"\n13c — Convergence (reinmax vs reinmax_v3, K=8):")
     for name, h in r13c.items():
         print(f"  {name:14s}: E[f]={h['ef'][-1]:.4f}  "
               f"overlap={h['overlap'][-1]:.3f}")
     print(f"  oracle          : E[f]={oracle_ef:.4f}")
+    print(f"\n13d — K ablation at N=256:")
+    print(f"  {'K':>5}  {'density':>8}  {'v3/rm':>7}  {'final E[f]':>11}  "
+          f"{'overlap':>8}  {'oracle':>7}")
+    for k in _K_ABLATION_VALUES:
+        d = summary['k_ablation'][str(k)]
+        print(f"  {k:>5}  {k/256:>8.1%}  {d['variance_ratio']:>7.3f}  "
+              f"{d['final_ef']:>11.4f}  {d['final_overlap']:>8.3f}  "
+              f"{d['oracle_ef']:>7.4f}")
 
 
 if __name__ == '__main__':
