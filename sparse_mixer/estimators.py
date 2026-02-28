@@ -29,10 +29,12 @@ ReinMax decomposes it into two terms:
 ReinMax-v3 replaces the analytical Jacobian in term1 with a Monte-Carlo estimate
 via the Rao-Gumbel conditional distribution, which gives a lower-variance Jacobian.
 
-ReinMax-CV adds a control variate to further reduce variance:
-  grad_cv = grad_reinmax - η*(J_GS * grad) + η*(J_GR * grad)
-where J_GS is the Gumbel-Softmax Jacobian (high-variance, unbiased per-sample)
-and J_GR is the Rao-Gumbel expected Jacobian (lower-variance).
+ReinMax-CV adds a control variate to further reduce variance.
+It uses 1-sample ReinMax-v3 as the base and R-sample ReinMax-v3 as the target:
+  grad_cv = g0 + 2*J_GR_1*grad + η * 2*(J_GR_R - J_GR_1)*grad
+where J_GR_1 and J_GR_R are 1-sample and R-sample Rao-Gumbel Jacobians
+evaluated at the same new_logits = log((pi + D)/2).
+At η=0: 1-sample ReinMax-v3.  At η=1: R-sample ReinMax-v3 = ReinMax-v3.
 """
 
 import torch
@@ -232,22 +234,26 @@ class _ReinMaxCVSingle(torch.autograd.Function):
     """
     ReinMax-CV for single-expert selection.
 
-    Control variate:  grad_cv = grad_reinmax - η*(J_GS - J_GR)*grad_z
-      J_GS: Gumbel-Softmax Jacobian at the specific Gumbel realisation
-      J_GR: Expected Rao-Gumbel Jacobian (lower-variance estimate)
+    Uses 1-sample ReinMax-v3 as the base gradient and an R-sample Rao-Gumbel
+    Jacobian as the control variate target.  Both are evaluated at
+    new_logits = log((pi + D)/2) from the same conditional distribution,
+    so the correction is exactly zero-mean in expectation:
 
-    Because E[J_GS * grad_z] ≈ E[J_GR * grad_z], the CV is zero-mean
-    in expectation and reduces variance.
+        grad_cv = g0 + 2*J_GR_1*grad + η * 2*(J_GR_R - J_GR_1)*grad
+
+    At η=0: 1-sample ReinMax-v3  (high variance)
+    At η=1: R-sample ReinMax-v3  = ReinMax-v3  (low variance)
+
+    η ∈ (0,1) interpolates, always reducing variance relative to η=0.
     """
 
     @staticmethod
     def forward(ctx, logits, tau, eta, repeats):
-        p       = F.softmax(logits, dim=-1)
-        gumbels = _sample_gumbel(logits.shape, device=logits.device, dtype=logits.dtype)
-        idx     = (logits + gumbels).argmax(dim=-1, keepdim=True)
-        z       = torch.zeros_like(logits).scatter_(-1, idx, 1.0)
+        p   = F.softmax(logits, dim=-1)
+        idx = torch.multinomial(p, num_samples=1)
+        z   = torch.zeros_like(logits).scatter_(-1, idx, 1.0)
         ctx.save_for_backward(
-            logits, z, p, gumbels,
+            logits, z, p,
             logits.new_tensor(tau),
             logits.new_tensor(eta),
             logits.new_tensor(float(repeats)),
@@ -256,35 +262,28 @@ class _ReinMaxCVSingle(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_z, grad_p):
-        logits, z, p, G, tau_t, eta_t, rep_t = ctx.saved_tensors
+        logits, z, p, tau_t, eta_t, rep_t = ctx.saved_tensors
         tau_v = tau_t.item()
         eta_v = eta_t.item()
         R     = int(rep_t.item())
 
-        # ── Base ReinMax gradient (alpha=1, tau=1 for term1) ──────────────
-        p_tau1 = F.softmax(logits, dim=-1)              # tau=1 for term1
-        shifted = 0.5 * (p_tau1 + z)
-        g1 = 2.0 * grad_z * shifted
-        g1 = g1 - shifted * g1.sum(dim=-1, keepdim=True)
+        # ── term0: same as ReinMax-v3 (alpha=1) ───────────────────────────
         g0 = -0.5 * grad_z * p + grad_p * p
         g0 = g0 - p * g0.sum(dim=-1, keepdim=True)
-        grad_reinmax = g0 + g1
 
-        # ── Control variate ───────────────────────────────────────────────
-        new_pi     = 0.5 * (p + z)
-        new_logits = new_pi.log()
+        # ── Rao-Gumbel Jacobians at new_logits = log((pi + D)/2) ──────────
+        new_logits = (0.5 * (p + z)).log()
 
-        # J_GS: Gumbel-Softmax Jacobian at (new_logits + G) / tau
-        p_gs  = F.softmax((new_logits + G) / tau_v, dim=-1)
-        J_gs  = _softmax_jacobian(p_gs) / tau_v                   # (B, N, N)
+        # 1-sample estimate (base of control variate)
+        J_gs  = _rao_gumbel_jacobian(new_logits, z, tau_v, 1)
         gv_gs = torch.matmul(J_gs, grad_z.unsqueeze(-1)).squeeze(-1)
 
-        # J_GR: Rao-Gumbel expected Jacobian at new_logits
-        J_gr  = _rao_gumbel_jacobian(new_logits, z, tau_v, R)     # (B, N, N)
+        # R-sample estimate (control variate target)
+        J_gr  = _rao_gumbel_jacobian(new_logits, z, tau_v, R)
         gv_gr = torch.matmul(J_gr, grad_z.unsqueeze(-1)).squeeze(-1)
 
-        # CV correction
-        g = grad_reinmax - eta_v * gv_gs + eta_v * gv_gr
+        # CV: interpolate from 1-sample to R-sample ReinMax-v3
+        g = g0 + 2.0 * gv_gs + eta_v * 2.0 * (gv_gr - gv_gs)
         return g - g.mean(dim=-1, keepdim=True), None, None, None
 
 
@@ -405,14 +404,26 @@ class _ReinMaxV3TopK(torch.autograd.Function):
 
 
 class _ReinMaxCVTopK(torch.autograd.Function):
-    """ReinMax-CV for top-K selection."""
+    """
+    ReinMax-CV for top-K selection.
+
+    Mirrors _ReinMaxCVSingle: uses 1-sample ReinMax-v3 as the base and
+    R-sample Rao-Gumbel Jacobians (decomposed per selected expert) as the
+    control variate target.  Both Jacobians are evaluated at the same
+    new_logits = log((pi + mask/k)/2), so the correction is zero-mean:
+
+        grad_cv = g0 + 2*J_GR_1*grad + η * 2*(J_GR_R - J_GR_1)*grad
+
+    At η=0: 1-sample ReinMax-v3-TopK
+    At η=1: R-sample ReinMax-v3-TopK  = ReinMax-v3-TopK
+    """
 
     @staticmethod
     def forward(ctx, logits, k, tau, eta, repeats):
         p = F.softmax(logits, dim=-1)
-        mask, _, gumbels = _gumbel_top_k(logits, k)
+        mask, _, _ = _gumbel_top_k(logits, k)
         ctx.save_for_backward(
-            logits, mask, p, gumbels,
+            logits, mask, p,
             logits.new_tensor(float(k)),
             logits.new_tensor(tau),
             logits.new_tensor(eta),
@@ -422,35 +433,29 @@ class _ReinMaxCVTopK(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_mask, grad_p):
-        logits, mask, p, G, k_t, tau_t, eta_t, rep_t = ctx.saved_tensors
+        logits, mask, p, k_t, tau_t, eta_t, rep_t = ctx.saved_tensors
         k     = int(k_t.item())
         tau_v = tau_t.item()
         eta_v = eta_t.item()
         R     = int(rep_t.item())
 
-        # ── Base ReinMax ──────────────────────────────────────────────────
-        z_norm  = mask / k
-        shifted = 0.5 * (p + z_norm)
-        g1 = 2.0 * grad_mask * shifted
-        g1 = g1 - shifted * g1.sum(dim=-1, keepdim=True)
+        # ── term0: same as ReinMax-v3-TopK ───────────────────────────────
         g0 = (-0.5 * grad_mask + grad_p) * p
         g0 = g0 - p * g0.sum(dim=-1, keepdim=True)
-        grad_reinmax = g0 + g1
 
-        # ── Control variate ───────────────────────────────────────────────
-        new_pi     = 0.5 * (p + z_norm)
-        new_logits = new_pi.log()
+        # ── Rao-Gumbel Jacobians at new_logits = log((pi + mask/k)/2) ────
+        new_logits = (0.5 * (p + mask / k)).log()
 
-        # J_GS: Gumbel-Softmax Jacobian
-        p_gs  = F.softmax((new_logits + G) / tau_v, dim=-1)
-        J_gs  = _softmax_jacobian(p_gs) / tau_v
+        # 1-sample estimate (base of control variate)
+        J_gs  = _rao_gumbel_jacobian_topk(new_logits, mask, k, tau_v, 1)
         gv_gs = torch.matmul(J_gs, grad_mask.unsqueeze(-1)).squeeze(-1)
 
-        # J_GR: Rao-Gumbel Jacobian (decomposed over selected experts)
+        # R-sample estimate (control variate target)
         J_gr  = _rao_gumbel_jacobian_topk(new_logits, mask, k, tau_v, R)
         gv_gr = torch.matmul(J_gr, grad_mask.unsqueeze(-1)).squeeze(-1)
 
-        g = grad_reinmax - eta_v * gv_gs + eta_v * gv_gr
+        # CV: interpolate from 1-sample to R-sample ReinMax-v3-TopK
+        g = g0 + 2.0 * gv_gs + eta_v * 2.0 * (gv_gr - gv_gs)
         return g - g.mean(dim=-1, keepdim=True), None, None, None, None
 
 
