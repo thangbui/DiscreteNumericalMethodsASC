@@ -7,6 +7,7 @@ bias_variance   Exp 1-4   K=1/K=2 bias & variance, convergence, e2e classificati
 ablation        Exp 5-11  Scale N, temperature, Rao-Gumbel repeats, η, K, optim-var, grid
 specialization  Exp 12    Expert specialization / switching linear regression
 sparse_routing  Exp 13    Very sparse routing: K=8 selected from N=256 experts
+cv_diagnosis    Exp 14    Why does ReinMax-CV underperform? Distribution-mismatch analysis
 
 Usage
 -----
@@ -84,6 +85,14 @@ def run_sparse_routing(fast: bool = False):
     print(f"\n[sparse_routing] done in {_elapsed(t0)}")
 
 
+def run_cv_diagnosis(fast: bool = False):
+    _banner("GROUP 5 — ReinMax-CV Diagnosis  (Exp 14)")
+    t0 = time.time()
+    from sparse_mixer.exp_cv_diagnosis import main as _main
+    _main(fast=fast)
+    print(f"\n[cv_diagnosis] done in {_elapsed(t0)}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -93,6 +102,7 @@ GROUP_MAP = {
     'ablation'       : run_ablation,
     'specialization' : run_specialization,
     'sparse_routing' : run_sparse_routing,
+    'cv_diagnosis'   : run_cv_diagnosis,
 }
 
 ALL_GROUPS = list(GROUP_MAP.keys())
